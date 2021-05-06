@@ -1,350 +1,737 @@
-const electron = require('electron')
-// Module to control application life.
-const {app, globalShortcut} = require('electron')
+const electron = require("electron");
+const {
+  app,
+  BrowserWindow,
+  globalShortcut,
+  ipcMain,
+  Menu,
+  session,
+  screen,
+  Tray,
+} = electron;
+const Store = require("electron-store");
+const { autoUpdater } = require("electron-updater");
+const { join } = require("path");
 
-const {ipcMain} = require('electron')
+const store = new Store();
+const iconPath = join(__dirname, "/listen1_chrome_extension/images/logo.png");
 
-// Module to create native browser window.
-const BrowserWindow = electron.BrowserWindow
+autoUpdater.checkForUpdatesAndNotify();
 
-var path = require('path')
-var iconPath = path.join(__dirname, '/listen1_chrome_extension/images/logo.png');
+let floatingWindowCssKey = undefined,
+  mainWindow,
+  appTray,
+  floatingWindow,
+  appIcon = null,
+  willQuitApp = false,
+  transparent = false,
+  trayIconPath;
 
+//platform-specific
+switch (process.platform) {
+  case "darwin":
+    trayIconPath = join(__dirname, "/resources/logo_16.png");
+    transparent = true;
+    break;
+  case "linux":
+  case "win32":
+    trayIconPath = join(__dirname, "/resources/logo_32.png");
+    // fix transparent window not working in linux bug
+    app.disableHardwareAcceleration();
+    break;
+  default:
+    break;
+}
 // Keep a global reference of the window object, if you don't, the window will
 // be closed automatically when the JavaScript object is garbage collected.
-let mainWindow
-let willQuitApp = false;
-var windowState = { maximized: false }
 
-const globalShortcutMapping = {
-  'CmdOrCtrl+Alt+Left':'left',
-  'CmdOrCtrl+Alt+Right':'right',
+const windowState = store.get("windowState") || {
+  width: 1000,
+  height: 670,
+  maximized: false,
+  zoomLevel: 0,
 };
 
-function initialTray(mainWindow) {
-  const {app, Menu, Tray} = require('electron');
+let proxyConfig = store.get("proxyConfig") || {
+  mode: "system",
+};
 
-  let appIcon = null;
+const globalShortcutMapping = {
+  "CmdOrCtrl+Alt+Left": "left",
+  "CmdOrCtrl+Alt+Right": "right",
+  "CmdOrCtrl+Alt+Space": "space",
+  MediaNextTrack: "right",
+  MediaPreviousTrack: "left",
+  MediaPlayPause: "space",
+};
 
-  var trayIconPath = path.join(__dirname, '/resources/logo_16.png');
-  appTray = new Tray(trayIconPath);
+function initialTray(mainWindow, track) {
+  if (track == null || track == undefined) {
+    track = {
+      title: "暂无歌曲",
+      artist: "  ",
+    };
+  }
+
+  let nowPlayingTitle = `${track.title}`;
+  let nowPlayingArtist = `歌手: ${track.artist}`;
 
   function toggleVisiable() {
-    var isVisible = mainWindow.isVisible();
-    if (isVisible) {
-      mainWindow.hide();
-    } else {
-      mainWindow.show();
-    }
+    mainWindow.isVisible() ? mainWindow.hide() : mainWindow.show();
   }
-  const contextMenu = Menu.buildFromTemplate([
-    {label: '显示/隐藏窗口',  click(){
-      toggleVisiable();
-    }},
-    {label: '退出',  click() {
-      app.quit();
-    }},
-  ]);
-  //appTray.setToolTip('This is my application.');
+  let menuTemplate = [
+    {
+      label: nowPlayingTitle,
+      click() {
+        mainWindow.show();
+      },
+    },
+    {
+      label: nowPlayingArtist,
+      click() {
+        mainWindow.show();
+      },
+    },
+    { type: "separator" },
+    {
+      label: "播放/暂停",
+      click() {
+        mainWindow.webContents.send("globalShortcut", "space");
+      },
+    },
+    {
+      label: "上一首",
+      click() {
+        mainWindow.webContents.send("globalShortcut", "left");
+      },
+    },
+    {
+      label: "下一首",
+      click() {
+        mainWindow.webContents.send("globalShortcut", "right");
+      },
+    },
+    {
+      label: "显示/隐藏窗口",
+      click() {
+        toggleVisiable();
+      },
+    },
+    {
+      label: "退出",
+      click() {
+        app.quit();
+      },
+    },
+  ];
+
+  const contextMenu = Menu.buildFromTemplate(menuTemplate);
+
+  if (appTray != null && appTray.destroy != undefined) {
+    // appTray had create, just refresh tray menu here
+    appTray.setContextMenu(contextMenu);
+    return;
+  }
+
+  appTray = new Tray(trayIconPath);
   appTray.setContextMenu(contextMenu);
-  appTray.on('click', function handleClicked () {
+  appTray.on("click", () => {
     toggleVisiable();
   });
 }
 
 function setKeyMapping(key, message) {
-    const ret = globalShortcut.register(key, () => {
-      mainWindow.webContents.send('globalShortcut', message);
-    });
+  const ret = globalShortcut.register(key, () => {
+    mainWindow.webContents.send("globalShortcut", message);
+  });
 }
 
 function enableGlobalShortcuts() {
   // initial global shortcuts
-  for (let key in globalShortcutMapping){
+  for (let key in globalShortcutMapping) {
     setKeyMapping(key, globalShortcutMapping[key]);
   }
 }
 
 function disableGlobalShortcuts() {
-  for (let key in globalShortcutMapping){
-    globalShortcut.unregister(key);
-  }
-
-  globalShortcut.unregisterAll()
+  globalShortcut.unregisterAll();
 }
 
-let floatingWindow;
-const createFloatingWindow = function () {
-  const electron = require('electron');
-  const BrowserWindow = electron.BrowserWindow;
-  const display = electron.screen.getPrimaryDisplay();
+function updateFloatingWindow(cssStyle) {
+  if (cssStyle === undefined) {
+    return;
+  }
+  if (floatingWindowCssKey === undefined) {
+    return floatingWindow.webContents
+      .insertCSS(cssStyle, {
+        cssOrigin: "author",
+      })
+      .then((newCssKey) => {
+        floatingWindowCssKey = newCssKey;
+      })
+      .catch((error) => {
+        console.log(error);
+      });
+  }
+
+  floatingWindow.webContents
+    .insertCSS(cssStyle, {
+      cssOrigin: "author",
+    })
+    .then((newCssKey) => {
+      floatingWindow.webContents
+        .removeInsertedCSS(floatingWindowCssKey)
+        .then(() => {
+          floatingWindowCssKey = newCssKey;
+        })
+        .catch((error) => {
+          console.log(error);
+        });
+    })
+    .catch((error) => {
+      console.log(error);
+    });
+}
+
+function updateProxyConfig(params) {
+  proxyConfig = params;
+
+  mainWindow.webContents.session.setProxy(proxyConfig).then(() => {
+    mainWindow.webContents.session.forceReloadProxyConfig();
+  });
+}
+function createFloatingWindow(cssStyle) {
+  const display = screen.getPrimaryDisplay();
+  if (process.platform === "linux") {
+    // fix transparent window not working in linux bug
+    floatingWindow?.destroy();
+    floatingWindow = null;
+  }
   if (!floatingWindow) {
-    floatingWindow = new BrowserWindow({
+    let opts = {
       width: 1000,
-      height: 80,
-      titleBarStyle: 'hide',
+      minWidth: 640,
+      maxWidth: 1920,
+      height: 70,
+      titleBarStyle: "hide",
       transparent: true,
       frame: false,
-      resizable: false,
+      resizable: true,
       hasShadow: false,
-      alwaysOnTop:true,
+      alwaysOnTop: true,
       visibleOnAllWorkspaces: true,
       webPreferences: {
-        nodeIntegration: true
-      }
-    });
-    floatingWindow.setPosition(floatingWindow.getPosition()[0], display.bounds.height - 150);
+        sandbox: true,
+        preload: join(__dirname, "preload.js"),
+      },
+    };
+    const winBounds = store.get("floatingWindowBounds");
+    Object.assign(opts, winBounds);
+
+    floatingWindow = new BrowserWindow(opts);
+
+    if (winBounds === undefined) {
+      floatingWindow.setPosition(
+        floatingWindow.getPosition()[0],
+        display.bounds.height - 150
+      );
+    }
+
     floatingWindow.setSkipTaskbar(true);
     floatingWindow.loadURL(`file://${__dirname}/floatingWindow.html`);
-    floatingWindow.setAlwaysOnTop(true, 'floating');
-    floatingWindow.on('closed', function () { floatingWindow = null })
+    floatingWindow.setAlwaysOnTop(true, "floating");
+    floatingWindow.setIgnoreMouseEvents(false);
+    // NOTICE: setResizable should be set, otherwise mouseleave event won't trigger in windows environment
+    floatingWindow.webContents.on("did-finish-load", () => {
+      updateFloatingWindow(cssStyle);
+    });
+    floatingWindow.on("closed", () => {
+      floatingWindow = null;
+    });
+
+    // floatingWindow.webContents.openDevTools();
   }
   floatingWindow.showInactive();
+}
+
+const previousButton = {
+  tooltip: "Previous",
+  icon: join(__dirname, "/resources/prev-song.png"),
+  click() {
+    mainWindow.webContents.send("globalShortcut", "left");
+  },
+};
+const nextButton = {
+  tooltip: "Next",
+  icon: join(__dirname, "/resources/next-song.png"),
+  click() {
+    mainWindow.webContents.send("globalShortcut", "right");
+  },
+};
+const playButton = {
+  tooltip: "Play",
+  icon: join(__dirname, "/resources/play-song.png"),
+  click() {
+    mainWindow.webContents.send("globalShortcut", "space");
+  },
+};
+const pauseButton = {
+  tooltip: "Pause",
+  icon: join(__dirname, "/resources/pause-song.png"),
+  click() {
+    mainWindow.webContents.send("globalShortcut", "space");
+  },
+};
+const setThumbarPause = () => {
+  mainWindow?.setThumbarButtons([previousButton, playButton, nextButton]);
+};
+const setThumbbarPlay = () => {
+  mainWindow?.setThumbarButtons([previousButton, pauseButton, nextButton]);
 };
 
 function createWindow() {
-
-  const session = require('electron').session;
-
   const filter = {
-    urls: ["*://music.163.com/*", "*://*.xiami.com/*", "*://i.y.qq.com/*", "*://c.y.qq.com/*", "*://*.kugou.com/*", "*://*.bilibili.com/*", "*://*.migu.cn/*", "*://*.githubusercontent.com/*",
-      "https://listen1.github.io/listen1/callback.html?code=*"]
+    urls: [
+      "*://*.music.163.com/*",
+      "*://music.163.com/*",
+      "*://*.xiami.com/*",
+      "*://i.y.qq.com/*",
+      "*://c.y.qq.com/*",
+      "*://*.kugou.com/*",
+      "*://*.kuwo.cn/*",
+      "*://*.bilibili.com/*",
+      "*://*.bilivideo.com/*",
+      "*://*.migu.cn/*",
+      "*://*.githubusercontent.com/*",
+      "https://listen1.github.io/listen1/callback.html?code=*",
+    ],
   };
 
-  session.defaultSession.webRequest.onBeforeSendHeaders(filter, function(details, callback) {
-    if(details.url.startsWith("https://listen1.github.io/listen1/callback.html?code=")){
-      const url = details.url;
-      const code = url.split('=')[1];
-      mainWindow.webContents.executeJavaScript('Github.handleCallback("'+code+'");');
+  session.defaultSession.webRequest.onBeforeSendHeaders(
+    filter,
+    (details, callback) => {
+      if (
+        details.url.startsWith(
+          "https://listen1.github.io/listen1/callback.html?code="
+        )
+      ) {
+        const { url } = details;
+        const code = url.split("=")[1];
+        mainWindow.webContents.executeJavaScript(
+          'GithubClient.github.handleCallback("' + code + '");'
+        );
+      } else {
+        hack_referer_header(details);
+      }
+      callback({ cancel: false, requestHeaders: details.requestHeaders });
     }
-    else {
-      hack_referer_header(details);
-    }
-    callback({cancel: false, requestHeaders: details.requestHeaders});
-  });
-
-  var transparent = false;
-  if (process.platform == 'darwin') {
-    transparent = true;
-  }
+  );
   // Create the browser window.
   mainWindow = new BrowserWindow({
-    width: 1000,
-    height: 670,
-    webPreferences: {'nodeIntegration': true},
+    width: windowState.width,
+    height: windowState.height,
+    minHeight: 300,
+    minWidth: 600,
+    webPreferences: {
+      nodeIntegration: true,
+      enableRemoteModule: true,
+      contextIsolation: false,
+    },
     icon: iconPath,
-    titleBarStyle: 'hiddenInset',
+    titleBarStyle: "hiddenInset",
     transparent: transparent,
-    vibrancy: 'light',
+    vibrancy: "light",
     frame: false,
-    hasShadow: true
+    hasShadow: true,
   });
 
-  // mainWindow.webContents.openDevTools();
+  mainWindow.on("ready-to-show", () => {
+    if (windowState.maximized) {
+      mainWindow.maximize();
+    }
+    mainWindow.webContents.send("setZoomLevel", windowState.zoomLevel);
+  });
 
-  mainWindow.on('close', (e) => {
+  mainWindow.on("resized", () => {
+    if (!mainWindow.isMaximized() && !mainWindow.isFullScreen()) {
+      const [width, height] = mainWindow.getSize();
+      windowState.width = width;
+      windowState.height = height;
+    }
+  });
+  mainWindow.on("close", (e) => {
     if (willQuitApp) {
       /* the user tried to quit the app */
       mainWindow = null;
     } else {
       /* the user only tried to close the window */
       //if (process.platform != 'linux') {
-        e.preventDefault();
-        mainWindow.hide();
-        //mainWindow.minimize();
+      e.preventDefault();
+      mainWindow.hide();
+      //mainWindow.minimize();
       //}
-
     }
   });
 
-
   // and load the index.html of the app.
-  var ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.119 Safari/537.36';
-  mainWindow.loadURL(`file://${__dirname}/listen1_chrome_extension/listen1.html`, {userAgent: ua})
+  const ua =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.119 Safari/537.36";
 
-  // Open the DevTools.
-  // mainWindow.webContents.openDevTools()
+  mainWindow.webContents.session.setProxy(proxyConfig).then(() => {
+    mainWindow.loadURL(
+      `file://${__dirname}/listen1_chrome_extension/listen1.html`,
+      { userAgent: ua }
+    );
+  });
 
+  setThumbarPause();
   // Emitted when the window is closed.
-  mainWindow.on('closed', function () {
+  mainWindow.on("closed", () => {
     // Dereference the window object, usually you would store windows
     // in an array if your app supports multi windows, this is the time
     // when you should delete the corresponding element.
-    mainWindow = null
-  })
+    mainWindow = null;
+  });
 
   // define global menu content, also add support for cmd+c and cmd+v shortcuts
-  var template = [{
+  const template = [
+    {
       label: "Application",
       submenu: [
-          { label: "About Application", selector: "orderFrontStandardAboutPanel:" },
-          { type: "separator" },
-          { label: "Quit", accelerator: "Command+Q", click: function() { app.quit(); }}
-      ]}, {
+        {
+          label: "Zoom Out",
+          accelerator: "CmdOrCtrl+=",
+          click() {
+            if (windowState.zoomLevel <= 2.5) {
+              windowState.zoomLevel += 0.5;
+              mainWindow.webContents.send(
+                "setZoomLevel",
+                windowState.zoomLevel
+              );
+            }
+          },
+        },
+        {
+          label: "Zoom in",
+          accelerator: "CmdOrCtrl+-",
+          click() {
+            if (windowState.zoomLevel >= -1) {
+              windowState.zoomLevel -= 0.5;
+              mainWindow.webContents.send(
+                "setZoomLevel",
+                windowState.zoomLevel
+              );
+            }
+          },
+        },
+        {
+          label: "Toggle Developer Tools",
+          accelerator: "F12",
+          click() {
+            mainWindow.toggleDevTools();
+          },
+        },
+        {
+          label: "About Application",
+          selector: "orderFrontStandardAboutPanel:",
+        },
+        { type: "separator" },
+        {
+          label: "Close Window",
+          accelerator: "CmdOrCtrl+W",
+          click() {
+            mainWindow.close();
+          },
+        },
+        {
+          label: "Quit",
+          accelerator: "Command+Q",
+          click() {
+            app.quit();
+          },
+        },
+      ],
+    },
+    {
       label: "Edit",
       submenu: [
-          { label: "Undo", accelerator: "CmdOrCtrl+Z", selector: "undo:" },
-          { label: "Redo", accelerator: "Shift+CmdOrCtrl+Z", selector: "redo:" },
-          { type: "separator" },
-          { label: "Cut", accelerator: "CmdOrCtrl+X", selector: "cut:" },
-          { label: "Copy", accelerator: "CmdOrCtrl+C", selector: "copy:" },
-          { label: "Paste", accelerator: "CmdOrCtrl+V", selector: "paste:" },
-          { label: "Select All", accelerator: "CmdOrCtrl+A", selector: "selectAll:" }
-      ]}
+        { label: "Undo", accelerator: "CmdOrCtrl+Z", selector: "undo:" },
+        { label: "Redo", accelerator: "Shift+CmdOrCtrl+Z", selector: "redo:" },
+        { type: "separator" },
+        { label: "Cut", accelerator: "CmdOrCtrl+X", selector: "cut:" },
+        { label: "Copy", accelerator: "CmdOrCtrl+C", selector: "copy:" },
+        { label: "Paste", accelerator: "CmdOrCtrl+V", selector: "paste:" },
+        {
+          label: "Select All",
+          accelerator: "CmdOrCtrl+A",
+          selector: "selectAll:",
+        },
+      ],
+    },
   ];
 
   mainWindow.setMenu(null);
 
-  electron.Menu.setApplicationMenu(electron.Menu.buildFromTemplate(template));
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 
   initialTray(mainWindow);
 }
 
 function hack_referer_header(details) {
-    let replace_referer = true;
-    let replace_origin = true;
-    let add_referer = true;
-    let add_origin = true;
-    var referer_value = '';
+  let replace_referer = true;
+  let replace_origin = true;
+  let add_referer = true;
+  let add_origin = true;
+  let referer_value = "";
+  let origin_value = "";
 
-    if (details.url.indexOf("://music.163.com/") != -1) {
-        referer_value = "http://music.163.com/";
-    }
-    if (details.url.indexOf("://gist.githubusercontent.com/") != -1) {
-        referer_value = "https://gist.githubusercontent.com/";
-    }
-
-    if (details.url.indexOf("api.xiami.com/") != -1 || details.url.indexOf('.xiami.com/song/playlist/id/') != -1) {
-        referer_value = "https://www.xiami.com/";
-    }
-
-    if ((details.url.indexOf("y.qq.com/") != -1) ||
-        (details.url.indexOf("qqmusic.qq.com/") != -1) ||
-        (details.url.indexOf("music.qq.com/") != -1) ||
-        (details.url.indexOf("imgcache.qq.com/") != -1)) {
-        referer_value = "http://y.qq.com/";
-    }
-    if (details.url.indexOf(".kugou.com/") != -1) {
-        referer_value = "http://www.kugou.com/";
-    }
-    if (details.url.indexOf(".kuwo.cn/") != -1) {
-        referer_value = "http://www.kuwo.cn/";
-    }
-    if (details.url.indexOf(".bilibili.com/") != -1) {
-        referer_value = "http://www.bilibili.com/";
-        replace_origin = false;
-        add_origin = false;
-    }
-    if (details.url.indexOf('.migu.cn') !== -1) {
-        referer_value = 'http://music.migu.cn/v3/music/player/audio?from=migu';
-    }
-
-    var isRefererSet = false;
-    var isOriginSet = false;
-    var headers = details.requestHeaders,
-        blockingResponse = {};
-
-    for (var i = 0, l = headers.length; i < l; ++i) {
-        if (replace_referer && (headers[i].name == 'Referer') && (referer_value != '')) {
-            headers[i].value = referer_value;
-            isRefererSet = true;
-        }
-        if (replace_origin && (headers[i].name == 'Origin') && (referer_value != '')) {
-            headers[i].value = referer_value;
-            isOriginSet = true;
-        }
-    }
-
-    if (add_referer && (!isRefererSet) && (referer_value != '')) {
-        headers["Referer"] = referer_value;
-    }
-
-    if (add_origin && (!isOriginSet) && (referer_value != '')) {
-        headers["Origin"] = referer_value;
-    }
-
-    details.requestHeaders = headers;
-};
-
-ipcMain.on('currentLyric', (event, arg) => {
-  if (floatingWindow && floatingWindow !== null) {
-    floatingWindow.webContents.send('currentLyric', arg);
+  if (details.url.includes("://music.163.com/")) {
+    referer_value = "http://music.163.com/";
   }
-})
+  if (details.url.includes("://interface3.music.163.com/")) {
+    referer_value = "http://music.163.com/";
+  }
+  if (details.url.includes("://gist.githubusercontent.com/")) {
+    referer_value = "https://gist.githubusercontent.com/";
+  }
 
-ipcMain.on('control', (event, arg) => {
-  // console.log(arg);
-  if(arg == 'enable_global_shortcut') {
-    enableGlobalShortcuts();
+  if (details.url.includes(".xiami.com/")) {
+    add_origin = false;
+    referer_value = "https://www.xiami.com/";
   }
-  else if(arg == 'disable_global_shortcut') {
-    disableGlobalShortcuts();
+  if (details.url.includes("www.xiami.com/api/search/searchSongs")) {
+    const key = /key%22:%22(.*?)%22/.exec(details.url)[1];
+    add_origin = false;
+    referer_value = `https://www.xiami.com/search?key=${key}`;
   }
-  else if (arg == 'enable_lyric_floating_window') {
-    createFloatingWindow();
+  if (details.url.includes("c.y.qq.com/")) {
+    referer_value = "https://y.qq.com/";
+    origin_value = "https://y.qq.com";
   }
-  else if (arg == 'disable_lyric_floating_window') {
-    if (floatingWindow) {
-      floatingWindow.hide();
+  if (
+    details.url.includes("y.qq.com/") ||
+    details.url.includes("qqmusic.qq.com/") ||
+    details.url.includes("music.qq.com/") ||
+    details.url.includes("imgcache.qq.com/")
+  ) {
+    referer_value = "http://y.qq.com/";
+  }
+  if (details.url.includes(".kugou.com/")) {
+    referer_value = "http://www.kugou.com/";
+  }
+  if (details.url.includes(".kuwo.cn/")) {
+    referer_value = "http://www.kuwo.cn/";
+  }
+  if (
+    details.url.includes(".bilibili.com/") ||
+    details.url.includes(".bilivideo.com/")
+  ) {
+    referer_value = "https://www.bilibili.com/";
+    replace_origin = false;
+    add_origin = false;
+  }
+  if (details.url.includes(".migu.cn")) {
+    referer_value = "http://music.migu.cn/v3/music/player/audio?from=migu";
+  }
+  if (details.url.includes("m.music.migu.cn")) {
+    referer_value = "https://m.music.migu.cn/";
+  }
+  if (origin_value == "") {
+    origin_value = referer_value;
+  }
+  let isRefererSet = false;
+  let isOriginSet = false;
+  let headers = details.requestHeaders;
+
+  for (let i = 0, l = headers.length; i < l; ++i) {
+    if (
+      replace_referer &&
+      headers[i].name == "Referer" &&
+      referer_value != ""
+    ) {
+      headers[i].value = referer_value;
+      isRefererSet = true;
+    }
+    if (replace_origin && headers[i].name == "Origin" && referer_value != "") {
+      headers[i].value = origin_value;
+      isOriginSet = true;
     }
   }
-  else if(arg == 'window_min') {
-    mainWindow.minimize();
+
+  if (add_referer && !isRefererSet && referer_value != "") {
+    headers["Referer"] = referer_value;
   }
-  else if(arg == 'window_max') {
-    if(windowState.maximized == true) {
-        windowState.maximized = false;
-        mainWindow.unmaximize();
-      } else {
-        windowState.maximized = true;
-        mainWindow.maximize();
-      }
+
+  if (add_origin && !isOriginSet && referer_value != "") {
+    headers["Origin"] = origin_value;
   }
-  else if(arg == 'window_close') {
-    mainWindow.close();
-  }
-  // event.sender.send('asynchronous-reply', 'pong')
-})
 
-
-const gotTheLock = app.requestSingleInstanceLock()
-
-if (!gotTheLock) {
-  app.quit()
-} else {
-  app.on('second-instance', (event, commandLine, workingDirectory) => {
-    // Someone tried to run a second instance, we should focus our window.
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.focus()
-    }
-  })
-
-  // Create myWindow, load the rest of the app, etc...
-  app.on('ready', () => {
-    createWindow()
-  })
+  details.requestHeaders = headers;
 }
 
+ipcMain.on("currentLyric", (event, arg) => {
+  if (floatingWindow && floatingWindow !== null) {
+    if (typeof arg === "string") {
+      floatingWindow.webContents.send("currentLyric", arg);
+      floatingWindow.webContents.send("currentLyricTrans", "");
+    } else {
+      floatingWindow.webContents.send("currentLyric", arg.lyric);
+      floatingWindow.webContents.send("currentLyricTrans", arg.tlyric);
+    }
+  }
+});
+
+ipcMain.on("trackPlayingNow", (event, track) => {
+  if (mainWindow != null) {
+    initialTray(mainWindow, track);
+  }
+});
+
+ipcMain.on("isPlaying", (event, isPlaying) => {
+  isPlaying ? setThumbbarPlay() : setThumbarPause();
+});
+
+ipcMain.on("control", (event, arg, params) => {
+  switch (arg) {
+    case "enable_global_shortcut":
+      enableGlobalShortcuts();
+      break;
+
+    case "disable_global_shortcut":
+      disableGlobalShortcuts();
+      break;
+
+    case "enable_lyric_floating_window":
+      createFloatingWindow(params);
+      break;
+
+    case "disable_lyric_floating_window":
+      floatingWindow?.hide();
+      break;
+
+    case "window_min":
+      mainWindow.minimize();
+      break;
+
+    case "window_max":
+      windowState.maximized ? mainWindow.unmaximize() : mainWindow.maximize();
+      windowState.maximized = !windowState.maximized;
+      break;
+
+    case "window_close":
+      mainWindow.close();
+      break;
+
+    case "float_window_accept_mouse_event":
+      floatingWindow.setIgnoreMouseEvents(false);
+      break;
+
+    case "float_window_ignore_mouse_event":
+      floatingWindow.setIgnoreMouseEvents(true, { forward: true });
+      break;
+
+    case "float_window_close":
+    case "float_window_font_small":
+    case "float_window_font_large":
+    case "float_window_background_light":
+    case "float_window_background_dark":
+    case "float_window_font_change_color":
+      mainWindow.webContents.send("lyricWindow", arg);
+      break;
+
+    case "update_lyric_floating_window_css":
+      updateFloatingWindow(params);
+      break;
+
+    case "get_proxy_config":
+      mainWindow.webContents.send("proxyConfig", proxyConfig);
+      break;
+
+    case "update_proxy_config":
+      updateProxyConfig(params);
+      break;
+
+    default:
+      break;
+  }
+  // event.sender.send('asynchronous-reply', 'pong')
+});
+
+ipcMain.on("openUrl", (event, arg, params) => {
+  const bWindow = new BrowserWindow({
+    parent: mainWindow,
+    height: 700,
+    resizable: true,
+    width: 985,
+    frame: true,
+    fullscreen: false,
+    maximizable: true,
+    minimizable: true,
+    autoHideMenuBar: true,
+    webPreferences: {
+      // sandbox is necessary for website js to work
+      // thanks to https://github.com/sunzongzheng/music
+      sandbox: true,
+    },
+  });
+  bWindow.loadURL(arg);
+  bWindow.setMenu(null);
+});
+
+ipcMain.on("floatWindowMoving", (e, { mouseX, mouseY }) => {
+  const { x, y } = screen.getCursorScreenPoint();
+  floatingWindow?.setPosition(x - mouseX, y - mouseY);
+});
+
+const gotTheLock = app.requestSingleInstanceLock();
+
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on("second-instance", (event, commandLine, workingDirectory) => {
+    // Someone tried to run a second instance, we should focus our window.
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+      // When start a new instance, show the main window and active in taskbar.
+      mainWindow.show();
+      mainWindow.setSkipTaskbar(false);
+    }
+  });
+
+  // Create myWindow, load the rest of the app, etc...
+  app.on("ready", () => {
+    createWindow();
+  });
+}
 
 // Quit when all windows are closed.
-app.on('window-all-closed', function () {
+app.on("window-all-closed", () => {
   // On OS X it is common for applications and their menu bar
   // to stay active until the user quits explicitly with Cmd + Q
-  if (process.platform !== 'darwin') {
-    app.quit()
+  if (process.platform !== "darwin") {
+    app.quit();
   }
-})
-
+});
 
 /* 'activate' is emitted when the user clicks the Dock icon (OS X) */
-app.on('activate', () => mainWindow.show());
+app.on("activate", () => mainWindow.show());
 
 /* 'before-quit' is emitted when Electron receives
  * the signal to exit and wants to start closing windows */
-app.on('before-quit', () => willQuitApp = true);
+app.on("before-quit", () => {
+  if (mainWindow.isDevToolsOpened()) {
+    mainWindow.closeDevTools();
+  }
+  if (floatingWindow) {
+    store.set("floatingWindowBounds", floatingWindow.getBounds());
+  }
+  store.set("windowState", windowState);
+  store.set("proxyConfig", proxyConfig);
 
-app.on('will-quit', () => {
- disableGlobalShortcuts();
-})
+  willQuitApp = true;
+});
 
+app.on("will-quit", () => {
+  disableGlobalShortcuts();
+});
